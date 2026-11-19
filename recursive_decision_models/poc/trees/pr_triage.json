@@ -1,0 +1,101 @@
+{
+  "root": "kind",
+  "resolve_instructions": "Which of these descriptions fits this pull request best?",
+  "nodes": {
+    "kind": {
+      "instructions": "What kind of change does this pull request mainly make?",
+      "state_keys": ["title", "files"],
+      "allow_none": true,
+      "options": {
+        "docs_only": {
+          "description": "Only documentation, comments or other prose files change; no code, configuration or dependency manifest is touched.",
+          "value": "docs"
+        },
+        "ci_or_tooling": {
+          "description": "Only CI workflows, build scripts, linters or developer tooling change; no shipped source code is touched.",
+          "value": "ci"
+        },
+        "dependency_update": {
+          "description": "The change is to dependency manifests or lock files, with at most mechanical follow-up edits.",
+          "next": "dependency"
+        },
+        "source_change": {
+          "description": "Shipped source code changes behaviour, structure or data.",
+          "next": "surface"
+        }
+      }
+    },
+    "dependency": {
+      "instructions": "What kind of dependency change is this?",
+      "state_keys": ["title", "files", "diff"],
+      "allow_none": true,
+      "options": {
+        "patch_or_minor": {
+          "description": "Existing dependencies move to a newer patch or minor version only.",
+          "value": "deps-minor"
+        },
+        "major": {
+          "description": "At least one existing dependency moves to a new major version.",
+          "value": "deps-major"
+        },
+        "new_dependency": {
+          "description": "At least one dependency is added that the project did not use before.",
+          "value": "deps-new"
+        }
+      }
+    },
+    "surface": {
+      "instructions": "Which part of the system does this source change touch most?",
+      "state_keys": ["title", "files", "diff"],
+      "allow_none": true,
+      "min_prob": 0.8,
+      "options": {
+        "auth_or_secrets": {
+          "description": "Authentication, authorization, session handling, cryptography, or the handling of credentials and secrets.",
+          "value": "security-review"
+        },
+        "data_model": {
+          "description": "Database schema, migrations, or the persisted shape of stored data.",
+          "next": "migration"
+        },
+        "public_api": {
+          "description": "A request or response shape, route, exported function or CLI flag that outside callers depend on.",
+          "value": "api-review"
+        },
+        "internal_logic": {
+          "description": "Internal behaviour with no change to stored data shape, public interface, or authentication.",
+          "next": "tests"
+        }
+      }
+    },
+    "migration": {
+      "instructions": "Can the previous release keep running against the data after this change is applied?",
+      "state_keys": ["files", "diff"],
+      "min_prob": 0.85,
+      "options": {
+        "compatible": {
+          "description": "Only additions: new tables, new nullable columns, new indexes. Nothing existing is removed, renamed or retyped.",
+          "value": "migration-additive"
+        },
+        "breaking": {
+          "description": "Something existing is dropped, renamed, retyped, made non-nullable, or rewritten in place.",
+          "value": "migration-breaking"
+        }
+      }
+    },
+    "tests": {
+      "instructions": "Does the diff add or change automated tests that exercise the changed logic?",
+      "state_keys": ["files", "diff"],
+      "options": {
+        "covered": {
+          "description": "Test files are added or changed and they exercise the changed behaviour.",
+          "value": "routine"
+        },
+        "not_covered": {
+          "description": "No test file is added or changed, or the test changes do not exercise the changed behaviour.",
+          "value": "needs-tests"
+        }
+      }
+    }
+  }
+}

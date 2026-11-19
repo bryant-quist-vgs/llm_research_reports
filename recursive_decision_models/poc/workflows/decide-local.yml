@@ -1,0 +1,196 @@
+# PROPOSAL — never run. Reference design B from ../../appendices/F-ci-github-runners.md:
+# run a small open decision model on the standard CPU runner. No API key, so it works
+# on fork pull requests, and the pull request's content never leaves the runner.
+#
+# To use: copy to .github/workflows/ and replace every REPLACE_ME. Actions are pinned
+# to the commit of their latest release as looked up on 2026-11-12; re-verify the
+# SHAs and the action inputs before first use. Read the caveats first:
+#   - Accuracy. Models small enough for a 2-4 vCPU runner are the weakest ones:
+#     near chance on hard or unfamiliar tasks, and they degrade past ~20 options per
+#     question (Appendices C and E). Keep every node to a handful of options and
+#     measure with ../depth_eval.py before trusting any label.
+#   - The server below is a placeholder. Von (ghcr.io/wfzyx/von) speaks /v1/systemone
+#     and has a CPU image, but the project was archived on 2026-10-19. Alternatives
+#     with the same wire shape: laya-serve (port 8000), llama.cpp `llama serve`,
+#     Ollama >= 0.35 (port 11434; at most 26 options per question, so pass
+#     --max-options 26), Ollaya (port 11435). Whichever you choose, pin the image by
+#     digest and the weights by revision.
+#   - No server documents a health endpoint, so readiness is probed with a real
+#     one-question request.
+#   - Service containers start before any step, so they cannot see a cache restored
+#     by a step. The server is therefore started with `docker run` after the restore.
+#   - Caches are saved only by the scheduled run on the default branch. Pull requests
+#     restore read-only; entries unused for 7 days are evicted, hence the schedule.
+#   - Same advisory-only and fail-open rules as decide-hosted.yml. An open model is as
+#     easy to steer with text inside the pull request as a hosted one.
+
+name: decide (local model, advisory)
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  schedule:
+    - cron: "17 5 */3 * *" # keep the weights cache warm (eviction is after 7 idle days)
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: decide-local-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  POC_DIR: recursive_decision_models/poc
+  SERVER_IMAGE: ghcr.io/wfzyx/von:cpu@sha256:REPLACE_ME # pin by digest
+  SERVER_PORT: "8000"
+  WEIGHTS_MOUNT: /data/huggingface # where this image keeps downloaded weights
+  WEIGHTS_KEY: decision-weights-von-REPLACE_ME # include the model revision
+  RDM_MODEL: REPLACE_ME # the model name this server expects in the request
+  RDM_BASE_URL: http://localhost:8000
+
+jobs:
+  warm-cache:
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Restore weights
+        id: weights
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/weights
+          key: ${{ env.WEIGHTS_KEY }}
+
+      - name: Start the server once so it downloads the weights
+        run: |
+          mkdir -p "$RUNNER_TEMP/weights"
+          docker run -d --name decide -p "$SERVER_PORT:$SERVER_PORT" \
+            -v "$RUNNER_TEMP/weights:$WEIGHTS_MOUNT" "$SERVER_IMAGE"
+
+      - name: Wait until it answers
+        run: |
+          probe='{"model":"'"$RDM_MODEL"'","state":"ping","questions":{"q":{"type":"choice","instructions":"Is this text a ping?","criteria":{"yes":"The text is a ping.","no":"The text is something else."}}}}'
+          for attempt in $(seq 1 120); do
+            if curl -fsS -o /dev/null -X POST "$RDM_BASE_URL/v1/systemone" \
+                 -H 'Content-Type: application/json' -d "$probe"; then
+              exit 0
+            fi
+            sleep 5
+          done
+          docker logs decide | tail -50
+          exit 1
+
+      - name: Stop the server and make the weights readable
+        if: always()
+        run: |
+          docker rm -f decide || true
+          sudo chown -R "$(id -u):$(id -g)" "$RUNNER_TEMP/weights" || true
+
+      - name: Save weights
+        if: steps.weights.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/weights
+          key: ${{ env.WEIGHTS_KEY }}
+
+  triage:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      status: ${{ steps.decide.outputs.status }}
+      value: ${{ steps.decide.outputs.value }}
+    steps:
+      - name: Check out the base commit (trusted runner, tree and thresholds)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          persist-credentials: false
+
+      - name: Restore weights (read-only; a miss means a slower first download)
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/weights
+          key: ${{ env.WEIGHTS_KEY }}
+
+      - name: Start the decision server
+        run: |
+          mkdir -p "$RUNNER_TEMP/weights"
+          docker run -d --name decide -p "$SERVER_PORT:$SERVER_PORT" \
+            -v "$RUNNER_TEMP/weights:$WEIGHTS_MOUNT" "$SERVER_IMAGE"
+
+      - name: Wait until it answers
+        id: ready
+        run: |
+          probe='{"model":"'"$RDM_MODEL"'","state":"ping","questions":{"q":{"type":"choice","instructions":"Is this text a ping?","criteria":{"yes":"The text is a ping.","no":"The text is something else."}}}}'
+          for attempt in $(seq 1 120); do
+            if curl -fsS -o /dev/null -X POST "$RDM_BASE_URL/v1/systemone" \
+                 -H 'Content-Type: application/json' -d "$probe"; then
+              echo "ready=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "ready=false" >> "$GITHUB_OUTPUT"   # fail open: report, do not fail the job
+
+      - name: Build the state from the pull request (data only)
+        if: steps.ready.outputs.ready == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          gh pr view "$PR" --repo "$REPO" --json title,body,files > "$RUNNER_TEMP/pr.json"
+          gh pr diff "$PR" --repo "$REPO" > "$RUNNER_TEMP/pr.diff"
+          # Small local models have short context windows (512-8,192 tokens for the
+          # encoder class). 6,000 characters is roughly 1.5k tokens; size this to the
+          # model you chose, and prefer nodes that read only title and file list.
+          jq -n --slurpfile pr "$RUNNER_TEMP/pr.json" --rawfile diff "$RUNNER_TEMP/pr.diff" \
+            '{title: $pr[0].title,
+              body: (($pr[0].body // "")[0:2000]),
+              files: [$pr[0].files[].path][0:100],
+              diff: $diff[0:6000]}' > "$RUNNER_TEMP/state.json"
+
+      - name: Decide
+        id: decide
+        run: |
+          if [ ! -f "$RUNNER_TEMP/state.json" ]; then
+            echo "status=error" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          set +e
+          python3 "$POC_DIR/rdm.py" \
+            --tree "$POC_DIR/trees/pr_triage.json" \
+            --state "$RUNNER_TEMP/state.json" \
+            --min-prob 0.80 --max-depth 4 --max-calls 8 --timeout 60 \
+            > "$RUNNER_TEMP/result.json"
+          code=$?
+          set -e
+          case "$code" in
+            0|3)
+              echo "status=$(jq -r '.status' "$RUNNER_TEMP/result.json")" >> "$GITHUB_OUTPUT"
+              echo "value=$(jq -r '.value // ""' "$RUNNER_TEMP/result.json")" >> "$GITHUB_OUTPUT"
+              ;;
+            *)
+              echo "status=error" >> "$GITHUB_OUTPUT"     # fail open
+              ;;
+          esac
+
+      - name: Report (advisory)
+        if: always()
+        env:
+          STATUS: ${{ steps.decide.outputs.status }}
+          VALUE: ${{ steps.decide.outputs.value }}
+        run: |
+          {
+            echo "### Decision-model triage (advisory, local model)"
+            echo ""
+            echo "- status: \`${STATUS:-error}\`"
+            echo "- suggested label: \`${VALUE:-none}\`"
+            echo "- model: \`$RDM_MODEL\` served by \`$SERVER_IMAGE\`"
+            echo ""
+            echo "This is a suggestion from a small non-generative model running on this runner. It is not a review."
+          } >> "$GITHUB_STEP_SUMMARY"
+          docker rm -f decide || true
