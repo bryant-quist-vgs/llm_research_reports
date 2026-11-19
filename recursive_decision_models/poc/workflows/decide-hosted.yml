@@ -1,0 +1,125 @@
+# PROPOSAL — never run. Reference design A from ../../appendices/F-ci-github-runners.md:
+# call a hosted decision model from a standard GitHub-hosted runner.
+#
+# To use: copy to .github/workflows/, add the repository secret TYPESAFE_API_KEY, and
+# adjust POC_DIR if the PoC lives elsewhere. Actions are pinned to the commit of their
+# latest release as looked up on 2026-11-12; re-verify the SHAs and the action inputs
+# before first use.
+#
+# Security properties this design relies on (do not weaken them):
+#   - Trigger is `pull_request`, never `pull_request_target`. PR code is never checked
+#     out or executed; the runner, tree and thresholds come from the BASE commit.
+#   - Fork PRs receive no secrets, so the job reports "skipped" (neutral) for them.
+#   - The result is ADVISORY: it is written to the job summary. It must not gate a
+#     merge, a deploy or a privileged step on its own. PR text is attacker-controlled
+#     and published attacks flip a large share of decisions (Appendix B, JevAdvBench).
+#   - API errors, timeouts and abstentions never fail the job (fail open).
+#   - Everything written to $GITHUB_OUTPUT is a fixed status word or a leaf value
+#     from the base-ref tree, never text from the PR or from the model.
+
+name: decide (hosted, advisory)
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: decide-hosted-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+env:
+  POC_DIR: recursive_decision_models/poc
+  # Pin an explicit version; thresholds are only valid for the version they were
+  # fitted on. Never use jev-latest on a threshold-sensitive path.
+  RDM_MODEL: jev-1.14.0
+  RDM_BASE_URL: https://api.typesafe.ai
+
+jobs:
+  triage:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      status: ${{ steps.decide.outputs.status }}
+      value: ${{ steps.decide.outputs.value }}
+    steps:
+      - name: Check out the base commit (trusted runner, tree and thresholds)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          persist-credentials: false
+
+      - name: Build the state from the pull request (data only)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          gh pr view "$PR" --repo "$REPO" --json title,body,files > "$RUNNER_TEMP/pr.json"
+          gh pr diff "$PR" --repo "$REPO" > "$RUNNER_TEMP/pr.diff"
+          # Cap the diff: every tree level re-sends the state, and long state costs
+          # accuracy as well as money. 60,000 characters is roughly 15k tokens.
+          jq -n --slurpfile pr "$RUNNER_TEMP/pr.json" --rawfile diff "$RUNNER_TEMP/pr.diff" \
+            '{title: $pr[0].title,
+              body: ($pr[0].body // ""),
+              files: [$pr[0].files[].path],
+              diff: $diff[0:60000]}' > "$RUNNER_TEMP/state.json"
+
+      - name: Decide
+        id: decide
+        env:
+          TYPESAFE_API_KEY: ${{ secrets.TYPESAFE_API_KEY }}
+        run: |
+          if [ -z "$TYPESAFE_API_KEY" ]; then
+            echo "status=skipped" >> "$GITHUB_OUTPUT"   # fork PR or secret not set
+            exit 0
+          fi
+          set +e
+          python3 "$POC_DIR/rdm.py" \
+            --tree "$POC_DIR/trees/pr_triage.json" \
+            --state "$RUNNER_TEMP/state.json" \
+            --min-prob 0.80 --max-depth 4 --max-calls 8 --timeout 20 \
+            > "$RUNNER_TEMP/result.json"
+          code=$?
+          set -e
+          # rdm.py exit codes: 0 decided, 3 abstained / depth / budget, 2 usage, 4 backend.
+          case "$code" in
+            0|3)
+              echo "status=$(jq -r '.status' "$RUNNER_TEMP/result.json")" >> "$GITHUB_OUTPUT"
+              echo "value=$(jq -r '.value // ""' "$RUNNER_TEMP/result.json")" >> "$GITHUB_OUTPUT"
+              ;;
+            *)
+              echo "status=error" >> "$GITHUB_OUTPUT"     # fail open
+              ;;
+          esac
+
+      - name: Report (advisory)
+        env:
+          STATUS: ${{ steps.decide.outputs.status }}
+          VALUE: ${{ steps.decide.outputs.value }}
+        run: |
+          {
+            echo "### Decision-model triage (advisory)"
+            echo ""
+            echo "- status: \`$STATUS\`"
+            echo "- suggested label: \`${VALUE:-none}\`"
+            echo "- model: \`$RDM_MODEL\`"
+            if [ -f "$RUNNER_TEMP/result.json" ] && [ "$STATUS" != "error" ]; then
+              echo ""
+              echo "| node | chosen | probability |"
+              echo "|---|---|---|"
+              jq -r '.path[] | "| \(.node) | \(.option) | \(.probability) |"' "$RUNNER_TEMP/result.json"
+              echo ""
+              echo "Requests: $(jq -r '.calls' "$RUNNER_TEMP/result.json"), input tokens: $(jq -r '.input_tokens' "$RUNNER_TEMP/result.json")"
+            fi
+            echo ""
+            echo "This is a suggestion from a non-generative decision model. It is not a review."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+# Applying a label needs `pull-requests: write`, which a fork PR's token does not have.
+# If you want labels, do it in a separate `workflow_run` workflow that consumes only
+# the two outputs above, validates `value` against an allow-list, and never checks out
+# or runs PR code.
